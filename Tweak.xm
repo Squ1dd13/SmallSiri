@@ -61,13 +61,26 @@ static BOOL getPrefBool(NSString* key, BOOL fallback)
     return value ? [value boolValue] : fallback;
 }
 
+static BOOL isSmall = NO;
+
 //change the frame and corner radius of the siri window - This is where the magic happens
 %hook SBAssistantWindow
+
 -(void)becomeKeyWindow
 {
     %orig;
+
+    //register for the notifications sent by AFConnection
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(expandSiriView) name:@"SmallSiriGoBig" object:nil];
+	   [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(contractSiriView) name:@"SmallSiriGoSmall" object:nil];
+    });
+
+
     if (!hasExpanded)
     {
+        //tf are these gibberish variable names?
         CGFloat yF = isX ? 44 : 10;
         if (getPrefBool(@"fromBottom", NO))
         {
@@ -89,6 +102,7 @@ static BOOL getPrefBool(NSString* key, BOOL fallback)
         swipeDownGesture = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(didSwipeDown)];
         swipeDownGesture.direction = UISwipeGestureRecognizerDirectionDown;
         [self.subviews[0] addGestureRecognizer:swipeDownGesture];
+	   isSmall = YES;
     }
 }
 
@@ -165,7 +179,24 @@ static BOOL getPrefBool(NSString* key, BOOL fallback)
             [sbSuperview addSubview:statusBar];
         }];
         hasExpanded = YES;
+	   isSmall = NO;
     }
+}
+
+%new
+-(void)contractSiriView {
+	[UIView animateWithDuration:0.5f animations:^{
+		CGFloat yF = isX ? 44 : 10;
+		if (getPrefBool(@"fromBottom", NO)) {
+			self.frame = CGRectMake(10, kHeight - 100, kWidth - 20, 90);
+		} else {
+			self.frame = CGRectMake(10, yF, kWidth - 20, 90);
+		}
+		self.subviews[0].layer.cornerRadius = 15;
+		self.subviews[0].clipsToBounds = YES;
+	} completion:^(BOOL finished) {
+		isSmall = YES;
+	}];
 }
 
 %new
@@ -195,6 +226,125 @@ static BOOL getPrefBool(NSString* key, BOOL fallback)
 }
 
 %end
+
+//XXX: Making siri bigger and smaller on user command (by Squ1dd13)
+
+@interface AceObject : NSObject
+@property(copy, nonatomic) NSString *refId;
+@property(copy, nonatomic) NSString *aceId;
+- (id)properties;
+- (id)dictionary;
++ (id)aceObjectWithDictionary:(id)arg1 context:(id)arg2;
+@end
+
+@interface AFConnection : NSObject
+@property (nonatomic, copy) NSString *userSpeech;
+@end
+
+#pragma mark Getting User Speech
+%hook AFConnectionClientServiceDelegate
+-(void)speechRecognized:(id)arg1 {
+	//arg1 --> recognition --> phrases --> object --> interpretations --> object --> tokens --> object --> text
+	NSMutableString *fullPhrase = [NSMutableString string];
+	NSArray *phrases = [(NSObject *)arg1 valueForKeyPath:@"recognition.phrases"];
+	if([phrases count] > 0) {
+		for(id phrase in phrases) {
+			NSArray *interpretations = [(NSObject *)phrase valueForKey:@"interpretations"];
+			if([interpretations count] > 0) {
+				id interpretation = interpretations[0];
+				NSArray *tokens = [(NSObject *)interpretation valueForKey:@"tokens"];
+				if([tokens count] > 0) {
+					for(id token in tokens) {
+						[fullPhrase appendString:[[(NSObject *)token valueForKey:@"text"] stringByAppendingString:@" "]];
+					}
+				}
+			}
+		}
+	}
+	NSString *speech = [[[fullPhrase copy] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] lowercaseString];
+	[[(NSObject *)self valueForKey:@"_connection"] setValue:speech forKey:@"userSpeech"];
+	%orig;
+}
+%end
+
+#pragma mark Custom reply
+%hook AFConnection
+%property (nonatomic, copy) NSString *userSpeech;
+
+-(void)_doCommand:(id)arg1 reply:(/*^block*/id)arg2 {
+	//work out if we should be giving a custom reply
+	NSString *notificationName = @"";
+	NSString *stringToSpeak = @"";
+	if([self.userSpeech isEqualToString:@"go smaller"]) {
+		if(isSmall) {
+			stringToSpeak = @"Sorry, I can't go any smaller.";
+			notificationName = @".";
+		} else {
+			stringToSpeak = @"Ok, I'll go smaller.";
+			notificationName = @"SmallSiriGoSmall";
+		}
+	} else if ([self.userSpeech isEqualToString:@"go bigger"]) {
+		if(!isSmall) {
+			stringToSpeak = @"Sorry, I can't go any bigger.";
+			notificationName = @".";
+		} else {
+			stringToSpeak = @"Ok, I'll go bigger.";
+			notificationName = @"SmallSiriGoBig";
+		}
+	} else {
+		//respond normally and quit
+		%orig;
+		return;
+	}
+
+	//create a context for the ace object
+	id context = NSClassFromString(@"BasicAceContext");
+	id object = arg1;
+
+	//get the original dictionary
+	NSMutableDictionary *dict = [[(NSObject *)object valueForKey:@"dictionary"] mutableCopy];
+
+	/*
+	How it works:
+	Siri processes what the user says to it, and then cooks up a reply. It then synthesizes the speech for the reply, while displaying a view with the spoken text.
+	To give custom replies, we need to a) change the string that is synthesized, and b) change the text of the view.
+	*/
+
+	//change the text on the views
+	if([dict objectForKey:@"views"]) {
+		NSArray *views = [dict objectForKey:@"views"];
+		NSMutableArray *modifiedViews = [NSMutableArray array];
+
+		//views is an array of dictionaries
+		for(NSDictionary *view in views) {
+			NSMutableDictionary *mutableView = [view mutableCopy];
+			[mutableView setValue:stringToSpeak forKey:@"speakableText"];
+			[mutableView setValue:stringToSpeak forKey:@"text"];
+			[modifiedViews addObject:[mutableView copy]];
+		}
+
+		[dict setValue:[modifiedViews copy] forKey:@"views"];
+	}
+
+	//change the speech string
+	if([dict objectForKey:@"dialogStrings"]) {
+		[dict setValue:@[stringToSpeak] forKey:@"dialogStrings"];
+	}
+
+	//create a new ace object with the modified dictionary
+	AceObject *aceObject = [%c(AceObject) aceObjectWithDictionary:[dict copy] context:context];
+
+	//run normally with the modified ace object and the original block
+	%orig(aceObject, arg2);
+
+	//now siri has spoken, we need to actually carry out the command
+	[[NSNotificationCenter defaultCenter] postNotificationName:notificationName object:nil userInfo:nil];
+
+	//reset
+	self.userSpeech = @"";
+}
+%end
+
 
 //hide the status bar in the siri window
 %hook UIStatusBar
